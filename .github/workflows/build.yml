@@ -1,0 +1,42 @@
+name: Build pixel
+on:
+  schedule:
+    - cron: '0 0 * * *'  
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v3
+
+      - name: set up dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3.12 python3.12-venv python3.12-distutils
+          aria2c https://bootstrap.pypa.io/get-pip.py && python3.12 get-pip.py && rm get-pip.py
+          sudo apt-get install -y dos2unix aria2 zip unzip p7zip-full curl jq
+
+      - name: insatlal payload_dumper
+        run: |
+          python3.12 -m pip install payload_dumper/
+
+      - name: downloadpixel
+        run: |
+          ./download_latest_ota_build.sh caiman  
+
+      - name: extract, build build.prop
+        run: |
+          ./extract_images.sh
+
+      - name: create release
+        run: |
+          ./create_release.sh
+
+      - name: Send Telegram Notification
+        run: |
+          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage \
+            -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -d text="Pixel Props build for Pixel 9 Pro Fold completed successfully!"
