@@ -1,4 +1,4 @@
-name: Build props (on schedule)
+name: Build props build.yml)
 
 on:
   workflow_dispatch:
