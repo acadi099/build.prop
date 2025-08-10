@@ -1,42 +1,130 @@
-name: Build pixel
+name: Build props (on schedule)
+
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'  
-  workflow_dispatch: {}
+    - cron: '37 13 7 * *' # At 13:37 on day-of-month 7. (UTC)
 
 jobs:
-  build:
+  prepare_build:
+    name: Create release
     runs-on: ubuntu-latest
-
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      id: ${{ steps.create_release.outputs.id }}
     steps:
-      - name: checkout repository
+      - name: Determine tag name
+        id: get_tag_name
+        run: |
+          echo "tag_name=$(date '+%Y%m%d')" >> $GITHUB_OUTPUT
+          echo "friendly_tag_name=$(date '+%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Create a release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.get_tag_name.outputs.tag_name }}
+          release_name: ${{ steps.get_tag_name.outputs.friendly_tag_name }}
+          draft: false
+          prerelease: false
+
+  build:
+    name: Build props
+    needs: prepare_build
+    strategy:
+      matrix:
+        # Devices to build props for
+        device_name: [ caiman, comet ]
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
         uses: actions/checkout@v3
 
-      - name: set up dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3.12 python3.12-venv python3.12-distutils
-          aria2c https://bootstrap.pypa.io/get-pip.py && python3.12 get-pip.py && rm get-pip.py
-          sudo apt-get install -y dos2unix aria2 zip unzip p7zip-full curl jq
+      - name: Install APT packages
+        uses: daaku/gh-action-apt-install@v4
+        with:
+          packages: dos2unix zip p7zip aria2
 
-      - name: insatlal payload_dumper
+      - name: Install Python 3.12
         run: |
-          python3.12 -m pip install payload_dumper/
+          sudo add-apt-repository ppa:deadsnakes/ppa -y
+          sudo apt-get update -y
+          sudo apt-get install -y python3.12 python3.12-dev python3.12-venv python3.12-distutils
 
-      - name: downloadpixel
+      - name: Install pip for Python 3.12
         run: |
-          ./download_latest_ota_build.sh caiman  
+          aria2c https://bootstrap.pypa.io/get-pip.py
+          python3.12 get-pip.py
+          rm get-pip.py
 
-      - name: extract, build build.prop
-        run: |
-          ./extract_images.sh
+      - name: Checkout submodules
+        id: submodule_checkout
+        run: git submodule update --init --recursive
 
-      - name: create release
-        run: |
-          ./create_release.sh
+      - name: Install payload_dumper
+        run: python3.12 -m pip install ./payload_dumper/
 
-      - name: Send Telegram Notification
+      - name: Make all scripts executable
+        run: chmod +x *.sh
+
+      - name: Download latest OTA build for ${{ matrix.device_name }}
+        run: ./download_latest_ota_build.sh ${{ matrix.device_name }}
+
+      - name: Extract images and build
+        id: extract_and_build
+        run: ./extract_images.sh
+
+      - name: Check if module build ID already exists
+        id: check_build_id
         run: |
-          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage \
-            -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
-            -d text="Pixel Props build for Pixel 9 Pro Fold completed successfully!"
+          BASENAME="${{ steps.extract_and_build.outputs.module_base_name }}"
+          BUILD_ID="${{ steps.extract_and_build.outputs.device_build_id }}"
+          EXISTING_RELEASE_NOTES=$(curl --silent "https://api.github.com/repos/$GITHUB_REPOSITORY/releases" | jq '.[].body')
+          if echo "$EXISTING_RELEASE_NOTES" | grep -q "${BASENAME}_${BUILD_ID}"; then
+            echo "BUILD_EXISTS=true" >> $GITHUB_OUTPUT
+          else
+            echo "BUILD_EXISTS=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload files to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.prepare_build.outputs.upload_url }}
+          asset_path: ./${{ steps.extract_and_build.outputs.module_base_name }}.zip
+          asset_name: ${{ steps.extract_and_build.outputs.module_base_name }}.zip
+          asset_content_type: application/zip
+        if: steps.check_build_id.outputs.BUILD_EXISTS == 'false'
+
+      - name: Add information to release
+        uses: irongut/EditRelease@v1.2.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          id: ${{ needs.prepare_build.outputs.id }}
+          replacebody: false
+          body: |
+            ## ${{ steps.extract_and_build.outputs.device_name }} (${{ steps.extract_and_build.outputs.device_codename }})
+            #### Module
+            - File name: `${{ steps.extract_and_build.outputs.module_base_name }}.zip`
+            - File hash (SHA256): `${{ steps.extract_and_build.outputs.module_hash }}`
+            #### Firmware
+            - Build Description: `${{ steps.extract_and_build.outputs.device_build_description }}`
+        if: steps.check_build_id.outputs.BUILD_EXISTS == 'false'
+
+      - name: Send to Telegram
+        run: |
+          {
+            echo '${{ steps.extract_and_build.outputs.device_name }} - ${{ steps.extract_and_build.outputs.device_codename }}';
+            echo '${{ steps.extract_and_build.outputs.device_build_description }}'
+          } > .tg_caption
+
+          curl -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/sendDocument" \
+          -H "Content-Type: multipart/form-data" \
+          -F "chat_id=${{ secrets.CHANNEL_ID }}" \
+          -F "document=@${{ steps.extract_and_build.outputs.module_base_name }}.zip;type=application/zip" \
+          -F "caption=$(cat .tg_caption)"
+        if: steps.check_build_id.outputs.BUILD_EXISTS == 'false'
